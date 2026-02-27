@@ -57,9 +57,11 @@ def scrape_one(url: str):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        context = browser.new_context(ignore_https_errors=True)
+        page = context.new_page()
         page.goto(url, wait_until="networkidle", timeout=60000)
         text = page.inner_text("body")
+        context.close()
         browser.close()
 
     # “Computer” is commonly used on the site; some pages may say “PC”
