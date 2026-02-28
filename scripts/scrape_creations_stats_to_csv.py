@@ -166,30 +166,37 @@ def scrape_one(url: str):
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(ignore_https_errors=True)
         page = context.new_page()
+        failed_requests = []
 
-        content_url_re = re.compile(rf"https://api\.bethesda\.net/ugcmods/v2/content/{re.escape(creation_id)}(?:\?.*)?$")
+        def on_request_failed(req):
+            failed_requests.append((req.resource_type, req.url, req.failure))
 
-        def on_response(resp):
-            nonlocal api_payload
-            if api_payload is not None:
-                return
-            if not content_url_re.match(resp.url):
-                return
-            if resp.status >= 400:
-                return
-            try:
-                api_payload = resp.json()
-            except Exception:
-                api_payload = None
-
-        page.on("response", on_response)
+        page.on("requestfailed", on_request_failed)
         page.goto(url, wait_until="networkidle", timeout=60000)
 
         # Keep text parsing only as a fallback strategy.
         text = page.inner_text("body")
-
         context.close()
         browser.close()
+
+    if not text.strip():
+        blocked = [u for _t, u, _f in failed_requests if "cdn01.bethesda.net" in u]
+        if blocked:
+            print(
+                "Warning: page data did not render because required CDN assets were blocked "
+                "(ERR_BLOCKED_BY_ORB). Falling back to Unknown row.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Warning: page rendered no text content; stats could not be parsed. "
+                "Falling back to Unknown row.",
+                file=sys.stderr,
+            )
+
+    # “Computer” is commonly used on the site; some pages may say “PC”
+    pc = find_platform_block(text, "Computer") or find_platform_block(text, "PC")
+    xbox = find_platform_block(text, "Xbox")
 
     rows = []
 
@@ -236,6 +243,18 @@ def scrape_one(url: str):
             "likes": None,
             "bookmarks": None,
             "url": url,
+        })
+
+    if not rows:
+        rows.append({
+            "date": run_date,
+            "creation_id": creation_id,
+            "slug": slug,
+            "platform": "Unknown",
+            "plays": None,
+            "likes": None,
+            "bookmarks": None,
+            "url": url
         })
 
     return rows
