@@ -57,10 +57,33 @@ def scrape_one(url: str):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        context = browser.new_context(ignore_https_errors=True)
+        page = context.new_page()
+        failed_requests = []
+
+        def on_request_failed(req):
+            failed_requests.append((req.resource_type, req.url, req.failure))
+
+        page.on("requestfailed", on_request_failed)
         page.goto(url, wait_until="networkidle", timeout=60000)
         text = page.inner_text("body")
+        context.close()
         browser.close()
+
+    if not text.strip():
+        blocked = [u for _t, u, _f in failed_requests if "cdn01.bethesda.net" in u]
+        if blocked:
+            print(
+                "Warning: page data did not render because required CDN assets were blocked "
+                "(ERR_BLOCKED_BY_ORB). Falling back to Unknown row.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Warning: page rendered no text content; stats could not be parsed. "
+                "Falling back to Unknown row.",
+                file=sys.stderr,
+            )
 
     # “Computer” is commonly used on the site; some pages may say “PC”
     pc = find_platform_block(text, "Computer") or find_platform_block(text, "PC")
@@ -90,6 +113,18 @@ def scrape_one(url: str):
             "plays": xbox["plays"],
             "likes": xbox["likes"],
             "bookmarks": xbox["bookmarks"],
+            "url": url
+        })
+
+    if not rows:
+        rows.append({
+            "date": run_date,
+            "creation_id": creation_id,
+            "slug": slug,
+            "platform": "Unknown",
+            "plays": None,
+            "likes": None,
+            "bookmarks": None,
             "url": url
         })
 
