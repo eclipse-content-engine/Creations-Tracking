@@ -256,6 +256,18 @@ def scrape_one(url: str):
             "url": url
         })
 
+    if not rows:
+        rows.append({
+            "date": run_date,
+            "creation_id": creation_id,
+            "slug": slug,
+            "platform": "Unknown",
+            "plays": None,
+            "likes": None,
+            "bookmarks": None,
+            "url": url
+        })
+
     return rows
 
 
