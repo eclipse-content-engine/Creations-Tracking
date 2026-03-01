@@ -15,7 +15,6 @@ def digits_to_int(s: str):
 
 
 def extract_id_and_slug(url: str):
-    # /en/starfield/details/<uuid>/<slug>/details
     m = re.search(r"/details/([0-9a-fA-F-]{36})/([^/]+)", url)
     return (m.group(1), m.group(2)) if m else (None, None)
 
