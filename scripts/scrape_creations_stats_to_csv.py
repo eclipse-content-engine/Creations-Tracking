@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
 
-def digits_to_int(s):
+def digits_to_int(s: str):
     if s is None:
         return None
     n = re.sub(r"[^\d]", "", str(s))
@@ -42,6 +42,10 @@ def find_first_int(data, keys):
 
 
 def extract_rows_from_api_payload(payload, run_date, creation_id, slug, url):
+    """
+    Primary extraction path: parse structured API payload returned by the app.
+    Tries known platform/stat layouts first, then a generic recursive fallback.
+    """
     rows_by_platform = {}
 
     def put(platform, likes, bookmarks, plays):
@@ -68,6 +72,7 @@ def extract_rows_from_api_payload(payload, run_date, creation_id, slug, url):
         plays = find_first_int(d, ["plays", "playCount", "totalPlays", "uses", "downloadCount"])
         return (likes, bookmarks, plays)
 
+    # Known-ish sections
     if isinstance(payload, dict):
         for key in ["platformStats", "statsByPlatform", "platforms", "stats"]:
             section = payload.get(key)
@@ -92,6 +97,7 @@ def extract_rows_from_api_payload(payload, run_date, creation_id, slug, url):
                     likes, bookmarks, plays = stats_from(source)
                     put(platform, likes, bookmarks, plays)
 
+    # Generic recursive scan for platform+stats dictionaries
     def walk(node):
         if isinstance(node, dict):
             platform = normalize_platform(
@@ -115,6 +121,11 @@ def extract_rows_from_api_payload(payload, run_date, creation_id, slug, url):
 
 
 def find_platform_block(text: str, platform_label: str):
+    """
+    Secondary fallback path: parse visible text blocks like:
+    Xbox. Likes. 52. Bookmarks. 683. ... Plays. 142,488
+    Computer. Likes. 16. Bookmarks. 159. ... Plays. 75,599
+    """
     m = re.search(rf"{platform_label}\s*(.*?)(?=(Xbox|Computer|PC)\b|$)", text, re.IGNORECASE | re.DOTALL)
     if not m:
         return None
@@ -139,25 +150,6 @@ def find_platform_block(text: str, platform_label: str):
     return {"likes": likes, "bookmarks": bookmarks, "plays": plays}
 
 
-def fetch_api_payload(context, creation_id: str):
-    """
-    Primary strategy: directly query content endpoint via Playwright APIRequestContext.
-    This avoids depending on the SPA to successfully bootstrap before we can parse stats.
-    """
-    endpoints = [
-        f"https://api.bethesda.net/ugcmods/v2/content/{creation_id}",
-        f"https://api.bethesda.net/ugcmods/v2/content/{creation_id}?draft=true",
-    ]
-    for endpoint in endpoints:
-        try:
-            resp = context.request.get(endpoint, timeout=30000)
-            if resp.status < 400:
-                return resp.json(), endpoint
-        except Exception:
-            pass
-    return None, None
-
-
 def scrape_one(url: str):
     parsed = urlparse(url)
     if parsed.netloc != "creations.bethesda.net":
@@ -165,53 +157,54 @@ def scrape_one(url: str):
 
     creation_id, slug = extract_id_and_slug(url)
     run_date = date.today().isoformat()
+
     api_payload = None
-    api_source = None
     text = ""
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(ignore_https_errors=True)
+        page = context.new_page()
+        failed_requests = []
 
-        # Strategy 1 (primary): direct API call.
-        api_payload, api_source = fetch_api_payload(context, creation_id)
+        def on_request_failed(req):
+            failed_requests.append((req.resource_type, req.url, req.failure))
 
-        # Strategy 2: if direct API call failed, attempt capture from browser responses.
-        if api_payload is None:
-            page = context.new_page()
-            content_url_re = re.compile(rf"https://api\.bethesda\.net/ugcmods/v2/content/{re.escape(creation_id)}(?:\?.*)?$")
+        page.on("requestfailed", on_request_failed)
+        page.goto(url, wait_until="networkidle", timeout=60000)
 
-            def on_response(resp):
-                nonlocal api_payload, api_source
-                if api_payload is not None:
-                    return
-                if not content_url_re.match(resp.url):
-                    return
-                if resp.status >= 400:
-                    return
-                try:
-                    api_payload = resp.json()
-                    api_source = resp.url
-                except Exception:
-                    api_payload = None
-
-            page.on("response", on_response)
-            page.goto(url, wait_until="networkidle", timeout=60000)
-
-            # Strategy 3 (fallback): legacy visible text parsing.
-            text = page.inner_text("body")
-
+        # Keep text parsing only as a fallback strategy.
+        text = page.inner_text("body")
         context.close()
         browser.close()
 
+    if not text.strip():
+        blocked = [u for _t, u, _f in failed_requests if "cdn01.bethesda.net" in u]
+        if blocked:
+            print(
+                "Warning: page data did not render because required CDN assets were blocked "
+                "(ERR_BLOCKED_BY_ORB). Falling back to Unknown row.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Warning: page rendered no text content; stats could not be parsed. "
+                "Falling back to Unknown row.",
+                file=sys.stderr,
+            )
+
+    # “Computer” is commonly used on the site; some pages may say “PC”
+    pc = find_platform_block(text, "Computer") or find_platform_block(text, "PC")
+    xbox = find_platform_block(text, "Xbox")
+
     rows = []
 
+    # Primary strategy: structured API payload
     if api_payload is not None:
         rows = extract_rows_from_api_payload(api_payload, run_date, creation_id, slug, url)
-        if rows:
-            print(f"Info: extracted stats from API payload ({api_source}).", file=sys.stderr)
 
-    if not rows and text:
+    # Secondary strategy: legacy text parsing
+    if not rows:
         pc = find_platform_block(text, "Computer") or find_platform_block(text, "PC")
         xbox = find_platform_block(text, "Xbox")
 
@@ -239,11 +232,7 @@ def scrape_one(url: str):
                 "url": url,
             })
 
-        if rows:
-            print("Info: extracted stats from visible text fallback.", file=sys.stderr)
-
     if not rows:
-        print("Warning: API and text extraction yielded no stats; writing Unknown row.", file=sys.stderr)
         rows.append({
             "date": run_date,
             "creation_id": creation_id,
@@ -253,6 +242,18 @@ def scrape_one(url: str):
             "likes": None,
             "bookmarks": None,
             "url": url,
+        })
+
+    if not rows:
+        rows.append({
+            "date": run_date,
+            "creation_id": creation_id,
+            "slug": slug,
+            "platform": "Unknown",
+            "plays": None,
+            "likes": None,
+            "bookmarks": None,
+            "url": url
         })
 
     return rows
